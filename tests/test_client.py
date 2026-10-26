@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -82,3 +84,23 @@ def test_blank_cookie_yields_no_authorization_header() -> None:
 
     assert client._aat_token == ""
     assert "Authorization-Request" not in headers
+
+
+def _b64(data: dict) -> str:
+    return base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
+
+
+def test_token_claims_decodes_jwt_payload_from_any_shape() -> None:
+    """token_claims reads the aat JWT payload, bare or inside a cookie header."""
+    token = f"{_b64({'alg': 'HS256'})}.{_b64({'iss': 'msauth-jwt', 'exp': 123})}.sig"
+    for pasted in (token, f"aat={token}", f"PHPSESSID=x; aat={token}; other=y"):
+        assert _make_client(pasted).token_claims() == {"iss": "msauth-jwt", "exp": 123}
+
+
+@pytest.mark.parametrize(
+    "access_token",
+    ["", "not-a-jwt", "a.b", "a.%%%.c", f"a.{_b64(['not', 'a', 'dict'])}.c"],
+)
+def test_token_claims_returns_none_for_non_jwt(access_token: str) -> None:
+    """Values that are not a JWT with an object payload yield None."""
+    assert _make_client(access_token).token_claims() is None

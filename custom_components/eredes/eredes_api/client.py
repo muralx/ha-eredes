@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
 import re
 from datetime import UTC, datetime
@@ -106,6 +109,23 @@ class ERedesClient:
     def _build_cookie_header(cookies: dict[str, str]) -> str:
         """Serialize a cookies dict into a Cookie request header."""
         return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    def token_claims(self) -> dict[str, Any] | None:
+        """Decode the aat JWT payload without verifying its signature.
+
+        Used for a cheap local check (issuer, expiry) before trusting a renewed
+        token; E-Redes still verifies it on the first API call. Returns None
+        when the value is not a JWT.
+        """
+        parts = self._aat_token.split(".")
+        if len(parts) != 3:
+            return None
+        try:
+            payload = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+            claims = json.loads(payload)
+        except ValueError, binascii.Error:
+            return None
+        return claims if isinstance(claims, dict) else None
 
     def update_access_token(self, access_token: str) -> None:
         """Update the access token."""
