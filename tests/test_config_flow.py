@@ -20,6 +20,8 @@ from custom_components.eredes.eredes_api import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from homeassistant.core import HomeAssistant
 
 
@@ -198,29 +200,49 @@ async def _add_entry(hass: HomeAssistant, data: dict) -> MockConfigEntry:
     return entry
 
 
-async def test_reauth_valid_token_skips_network(
+@pytest.fixture
+def mock_check_token() -> Generator[AsyncMock]:
+    """Patch the quick online token check (E-Redes accepts by default)."""
+    with patch(
+        "custom_components.eredes.config_flow.ERedesClient.check_token",
+        new_callable=AsyncMock,
+    ) as check:
+        yield check
+
+
+@pytest.fixture
+def mock_validate_token() -> Generator[AsyncMock]:
+    """Patch the slow full validation (used for new CPEs only)."""
+    with patch(
+        "custom_components.eredes.config_flow.ERedesClient.validate_token",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as validate:
+        yield validate
+
+
+async def test_reauth_valid_token_uses_quick_check(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,  # noqa: ARG001
     mock_config_entry_data: dict,
+    mock_check_token: AsyncMock,
+    mock_validate_token: AsyncMock,
 ) -> None:
-    """A renewed, unexpired token is accepted without calling E-Redes."""
+    """A renewed token is accepted after the quick check, not a data fetch."""
     entry = await _add_entry(hass, mock_config_entry_data)
     result = await entry.start_reauth_flow(hass)
     token = _fresh_token()
 
-    with patch(
-        "custom_components.eredes.config_flow.ERedesClient.validate_token",
-        new_callable=AsyncMock,
-    ) as validate:
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {CONF_ACCESS_TOKEN: token}
-        )
-        await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_ACCESS_TOKEN: token}
+    )
+    await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
     assert entry.data[CONF_ACCESS_TOKEN] == token
-    validate.assert_not_awaited()
+    mock_check_token.assert_awaited_once_with(mock_config_entry_data[CONF_CPE])
+    mock_validate_token.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -235,13 +257,14 @@ async def test_reauth_valid_token_skips_network(
         pytest.param(_jwt(iss="msauth-jwt"), id="no_expiry"),
     ],
 )
-async def test_reauth_rejects_unusable_token(
+async def test_reauth_rejects_unusable_token_without_network(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,  # noqa: ARG001
     mock_config_entry_data: dict,
+    mock_check_token: AsyncMock,
     token: str,
 ) -> None:
-    """Malformed, expired or foreign tokens are rejected locally."""
+    """Malformed, expired or foreign tokens are rejected before any request."""
     entry = await _add_entry(hass, mock_config_entry_data)
     result = await entry.start_reauth_flow(hass)
 
@@ -252,12 +275,42 @@ async def test_reauth_rejects_unusable_token(
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "invalid_auth"}
     assert entry.data == mock_config_entry_data
+    mock_check_token.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "error"),
+    [
+        (ERedesAuthenticationError("rejected"), "invalid_auth"),
+        (ERedesConnectionError("unreachable"), "cannot_connect"),
+    ],
+)
+async def test_reauth_quick_check_failures(
+    hass: HomeAssistant,
+    mock_config_entry_data: dict,
+    mock_check_token: AsyncMock,
+    side_effect: Exception,
+    error: str,
+) -> None:
+    """A token E-Redes rejects, or an unreachable E-Redes, is reported."""
+    mock_check_token.side_effect = side_effect
+    entry = await _add_entry(hass, mock_config_entry_data)
+    result = await entry.start_reauth_flow(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_ACCESS_TOKEN: _fresh_token()}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
+    assert entry.data == mock_config_entry_data
 
 
 async def test_reauth_accepts_cookie_header(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,  # noqa: ARG001
     mock_config_entry_data: dict,
+    mock_check_token: AsyncMock,  # noqa: ARG001
 ) -> None:
     """The aat token is found inside a pasted Cookie header too."""
     entry = await _add_entry(hass, mock_config_entry_data)
@@ -273,54 +326,51 @@ async def test_reauth_accepts_cookie_header(
     assert result["reason"] == "reauth_successful"
 
 
-async def test_reconfigure_same_cpe_skips_network(
+async def test_reconfigure_same_cpe_uses_quick_check(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,  # noqa: ARG001
     mock_config_entry_data: dict,
+    mock_check_token: AsyncMock,
+    mock_validate_token: AsyncMock,
 ) -> None:
-    """Renewing the token for the same CPE uses the local check."""
+    """Renewing the token for the same CPE uses the quick check."""
     entry = await _add_entry(hass, mock_config_entry_data)
     result = await entry.start_reconfigure_flow(hass)
     token = _fresh_token()
 
-    with patch(
-        "custom_components.eredes.config_flow.ERedesClient.validate_token",
-        new_callable=AsyncMock,
-    ) as validate:
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {CONF_ACCESS_TOKEN: token, CONF_CPE: mock_config_entry_data[CONF_CPE]},
-        )
-        await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_ACCESS_TOKEN: token, CONF_CPE: mock_config_entry_data[CONF_CPE]},
+    )
+    await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reconfigure_successful"
     assert entry.data[CONF_ACCESS_TOKEN] == token
-    validate.assert_not_awaited()
+    mock_check_token.assert_awaited_once()
+    mock_validate_token.assert_not_awaited()
 
 
 async def test_reconfigure_new_cpe_validates_with_eredes(
     hass: HomeAssistant,
     mock_setup_entry: AsyncMock,  # noqa: ARG001
     mock_config_entry_data: dict,
+    mock_check_token: AsyncMock,
+    mock_validate_token: AsyncMock,
 ) -> None:
     """A different CPE still gets the full check against E-Redes."""
     entry = await _add_entry(hass, mock_config_entry_data)
     result = await entry.start_reconfigure_flow(hass)
     new_cpe = "PT0002000087654321ZZ"
 
-    with patch(
-        "custom_components.eredes.config_flow.ERedesClient.validate_token",
-        new_callable=AsyncMock,
-        return_value=True,
-    ) as validate:
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {CONF_ACCESS_TOKEN: _fresh_token(), CONF_CPE: new_cpe},
-        )
-        await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_ACCESS_TOKEN: _fresh_token(), CONF_CPE: new_cpe},
+    )
+    await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reconfigure_successful"
     assert entry.data[CONF_CPE] == new_cpe
-    validate.assert_awaited_once_with(new_cpe)
+    mock_validate_token.assert_awaited_once_with(new_cpe)
+    mock_check_token.assert_not_awaited()

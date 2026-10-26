@@ -93,7 +93,9 @@ class ERedesConfigFlow(ConfigFlow, domain=DOMAIN):
             assert self._reauth_entry is not None
 
             # The CPE is already known to be valid: only the token changes.
-            error = self._check_token_locally(user_input[CONF_ACCESS_TOKEN])
+            error = await self._check_renewed_token(
+                user_input[CONF_ACCESS_TOKEN], self._reauth_entry.data[CONF_CPE]
+            )
 
             if error:
                 errors["base"] = error
@@ -147,7 +149,9 @@ class ERedesConfigFlow(ConfigFlow, domain=DOMAIN):
                     user_input[CONF_ACCESS_TOKEN], user_input[CONF_CPE]
                 )
             else:
-                error = self._check_token_locally(user_input[CONF_ACCESS_TOKEN])
+                error = await self._check_renewed_token(
+                    user_input[CONF_ACCESS_TOKEN], user_input[CONF_CPE]
+                )
 
             if error:
                 errors["base"] = error
@@ -177,14 +181,15 @@ class ERedesConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    def _check_token_locally(self, access_token: str) -> str | None:
-        """Check a renewed token without calling E-Redes.
+    async def _check_renewed_token(self, access_token: str, cpe: str) -> str | None:
+        """Check a renewed token quickly.
 
-        E-Redes' data endpoint takes over a minute to answer, which made token
-        renewal slow; the reload after saving also did a full fetch while the
-        flow waited. The aat token is a JWT, so check its issuer and expiry
-        here. A token E-Redes still rejects fails on the first fetch after the
-        (scheduled) reload, which starts the reauth flow as before.
+        E-Redes' data endpoint takes over a minute to answer an accepted token,
+        which made token renewal slow; the reload after saving also did a full
+        fetch while the flow waited. Instead: check the aat JWT's issuer and
+        expiry locally, then ask E-Redes whether it accepts the token with a
+        request that fetches no data and a short timeout (see
+        ERedesClient.check_token).
 
         Returns an error key if the token is not usable, None otherwise.
         """
@@ -197,6 +202,12 @@ class ERedesConfigFlow(ConfigFlow, domain=DOMAIN):
             time.time() + TOKEN_EXPIRY_MARGIN_SECONDS
         ):
             return "invalid_auth"
+        try:
+            await client.check_token(cpe)
+        except ERedesAuthenticationError:
+            return "invalid_auth"
+        except ERedesConnectionError:
+            return "cannot_connect"
         return None
 
     async def _test_credentials(self, access_token: str, cpe: str) -> str | None:
